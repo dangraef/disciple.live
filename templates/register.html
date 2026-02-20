@@ -1,0 +1,21 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card narrow">
+  <h2>Create Account</h2>
+  <form method="post">
+    <label>Name<input type="text" name="name" required /></label>
+    <label>Email<input type="email" name="email" required /></label>
+    <label>Password<input type="password" name="password" required /></label>
+    <label>Role
+      <select name="role" required>
+        <option value="disciplee">Disciplee (seeking mentorship)</option>
+        <option value="disciplier">Discipler (mentor)</option>
+      </select>
+    </label>
+    <label>Bio (optional)
+      <textarea name="bio" rows="3" placeholder="Share your background, focus, or testimony"></textarea>
+    </label>
+    <button type="submit">Register</button>
+  </form>
+</div>
+{% endblock %}

@@ -1,0 +1,44 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Admin Portal</h2>
+<div class="grid two">
+  <section class="card">
+    <h3>Upload Interactive Content</h3>
+    <form method="post" action="{{ url_for('upload_content') }}" enctype="multipart/form-data">
+      <label>Title<input type="text" name="title" required /></label>
+      <label>Description<textarea name="description" rows="3"></textarea></label>
+      <label>Upload File<input type="file" name="content_file" /></label>
+      <label>External URL<input type="url" name="external_url" placeholder="https://..." /></label>
+      <button type="submit">Publish Module</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h3>Users</h3>
+    <table>
+      <thead><tr><th>Name</th><th>Email</th><th>Role</th></tr></thead>
+      <tbody>
+        {% for account in users %}
+        <tr><td>{{ account.name }}</td><td>{{ account.email }}</td><td>{{ account.role }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</div>
+
+<section class="card">
+  <h3>Content Library</h3>
+  <ul>
+    {% for m in modules %}
+    <li>
+      <strong>{{ m.title }}</strong> by {{ m.creator_name }}
+      {% if m.file_path %}- <a href="{{ url_for('uploaded_file', filename=m.file_path) }}">Download</a>{% endif %}
+      {% if m.external_url %}- <a href="{{ m.external_url }}" target="_blank">External Link</a>{% endif %}
+      <p>{{ m.description }}</p>
+    </li>
+    {% else %}
+    <li>No modules yet.</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endblock %}

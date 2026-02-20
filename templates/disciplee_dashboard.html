@@ -1,0 +1,73 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Disciplee Dashboard</h2>
+<div class="grid two">
+  <section class="card">
+    <h3>Request a Discipler</h3>
+    {% for d in disciplers %}
+    <article class="mini-card">
+      <h4>{{ d.name }}</h4>
+      <p>{{ d.bio }}</p>
+      <form method="post" action="{{ url_for('request_mentor') }}">
+        <input type="hidden" name="discipler_id" value="{{ d.id }}" />
+        <textarea name="message" rows="2" placeholder="Share what you'd like to learn"></textarea>
+        <button type="submit">Send Request</button>
+      </form>
+    </article>
+    {% else %}
+    <p>No disciplers are registered yet.</p>
+    {% endfor %}
+  </section>
+
+  <section class="card">
+    <h3>Your Requests</h3>
+    <ul>
+      {% for req in requests %}
+      <li>{{ req.discipler_name }} - <strong>{{ req.status }}</strong></li>
+      {% else %}
+      <li>No requests yet.</li>
+      {% endfor %}
+    </ul>
+  </section>
+</div>
+
+<div class="grid two">
+  <section class="card">
+    <h3>Book a Session</h3>
+    <form method="post" action="{{ url_for('book_session') }}">
+      <label>Select Slot
+        <select name="slot_id" required>
+          <option value="">Choose...</option>
+          {% for slot in slots %}
+          <option value="{{ slot.id }}">{{ slot.discipler_name }} — {{ slot.slot_time }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Optional Content Module
+        <select name="content_module_id">
+          <option value="">None</option>
+          {% for m in modules %}
+          <option value="{{ m.id }}">{{ m.title }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button type="submit">Book Session</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h3>Upcoming Sessions</h3>
+    <ul>
+      {% for s in sessions %}
+      <li>
+        {{ s.discipler_name }}
+        {% if s.module_title %}| {{ s.module_title }}{% endif %}
+        <a href="{{ url_for('session_room', session_id=s.id) }}">Join Room</a>
+      </li>
+      {% else %}
+      <li>No sessions yet.</li>
+      {% endfor %}
+    </ul>
+  </section>
+</div>
+{% endblock %}
