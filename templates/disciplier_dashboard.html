@@ -1,0 +1,59 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Discipler Dashboard</h2>
+<div class="grid two">
+  <section class="card">
+    <h3>Add Availability</h3>
+    <form method="post" action="{{ url_for('add_slot') }}">
+      <label>Date & Time
+        <input type="datetime-local" name="slot_time" required />
+      </label>
+      <button type="submit">Add Slot</button>
+    </form>
+    <h4>Your Slots</h4>
+    <ul>
+      {% for slot in slots %}
+      <li>{{ slot.slot_time }} {% if slot.is_booked %}(booked){% else %}(open){% endif %}</li>
+      {% else %}
+      <li>No slots yet.</li>
+      {% endfor %}
+    </ul>
+  </section>
+
+  <section class="card">
+    <h3>Mentorship Requests</h3>
+    <ul>
+      {% for req in incoming %}
+      <li>
+        <strong>{{ req.disciplee_name }}</strong> ({{ req.disciplee_email }})
+        <p>{{ req.message }}</p>
+        <p>Status: {{ req.status }}</p>
+        {% if req.status == 'pending' %}
+        <form method="post" action="{{ url_for('respond_request', request_id=req.id) }}" class="inline-form">
+          <button name="decision" value="accepted">Accept</button>
+          <button name="decision" value="declined" class="danger">Decline</button>
+        </form>
+        {% endif %}
+      </li>
+      {% else %}
+      <li>No requests yet.</li>
+      {% endfor %}
+    </ul>
+  </section>
+</div>
+
+<section class="card">
+  <h3>Booked Sessions</h3>
+  <ul>
+    {% for s in sessions %}
+    <li>
+      Session with {{ s.disciplee_name }}
+      {% if s.module_title %} | Module: {{ s.module_title }}{% endif %}
+      <a href="{{ url_for('session_room', session_id=s.id) }}">Open Room</a>
+    </li>
+    {% else %}
+    <li>No sessions booked yet.</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endblock %}
