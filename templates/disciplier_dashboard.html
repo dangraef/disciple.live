@@ -1,10 +1,10 @@
 {% extends 'base.html' %}
 {% block content %}
-<h2>Discipler Dashboard</h2>
+<div class="page-heading"><p class="eyebrow">WALK ALONGSIDE SOMEONE</p><h1>Welcome, {{ user.name }}.</h1><p>Respond to introductions and make room for your next conversation.</p><p class="small">One-hour meetings. Times shown in {{ user.timezone }}. <a href="{{ url_for('profile') }}">Change time zone</a></p></div>{% include '_meetings.html' %}
 <div class="grid two">
   <section class="card">
     <h3>Add Availability</h3>
-    <form method="post" action="{{ url_for('add_slot') }}">
+    <form method="post" action="{{ url_for('add_slot') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <label>Date & Time
         <input type="datetime-local" name="slot_time" required />
       </label>
@@ -13,7 +13,7 @@
     <h4>Your Slots</h4>
     <ul>
       {% for slot in slots %}
-      <li>{{ slot.slot_time }} {% if slot.is_booked %}(booked){% else %}(open){% endif %}</li>
+      <li>{{ slot.slot_time|localtime }} {% if slot.is_booked %}(booked){% else %}(open)<form method="post" action="{{ url_for('delete_slot', slot_id=slot.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="text-button">Remove availability</button></form>{% endif %}</li>
       {% else %}
       <li>No slots yet.</li>
       {% endfor %}
@@ -29,7 +29,7 @@
         <p>{{ req.message }}</p>
         <p>Status: {{ req.status }}</p>
         {% if req.status == 'pending' %}
-        <form method="post" action="{{ url_for('respond_request', request_id=req.id) }}" class="inline-form">
+        <form method="post" action="{{ url_for('respond_request', request_id=req.id) }}" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button name="decision" value="accepted">Accept</button>
           <button name="decision" value="declined" class="danger">Decline</button>
         </form>
@@ -42,18 +42,4 @@
   </section>
 </div>
 
-<section class="card">
-  <h3>Booked Sessions</h3>
-  <ul>
-    {% for s in sessions %}
-    <li>
-      Session with {{ s.disciplee_name }}
-      {% if s.module_title %} | Module: {{ s.module_title }}{% endif %}
-      <a href="{{ url_for('session_room', session_id=s.id) }}">Open Room</a>
-    </li>
-    {% else %}
-    <li>No sessions booked yet.</li>
-    {% endfor %}
-  </ul>
-</section>
 {% endblock %}

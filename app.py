@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import os
 import secrets
+import click
+import re
+import time
+from urllib.parse import urlsplit
+from datetime import timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import sqlite3
 from contextlib import closing
 from datetime import datetime
@@ -9,6 +15,7 @@ from pathlib import Path
 
 from flask import (
     Flask,
+    abort,
     flash,
     g,
     redirect,
@@ -22,12 +29,20 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "disciple_live.db"
-UPLOAD_DIR = BASE_DIR / "uploads"
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "instance")))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "disciple_live.db"
+UPLOAD_DIR = DATA_DIR / "uploads"
 ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "ppt", "pptx", "txt", "md"}
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+secret = os.environ.get("SECRET_KEY")
+if not secret or len(secret) < 32:
+    raise RuntimeError("Set SECRET_KEY to a random value of at least 32 characters.")
+app.config.update(SECRET_KEY=secret, MAX_CONTENT_LENGTH=16 * 1024 * 1024,
+                  SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+                  SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "1") == "1",
+                  PERMANENT_SESSION_LIFETIME=timedelta(hours=12))
 app.config["UPLOAD_FOLDER"] = str(UPLOAD_DIR)
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -36,6 +51,8 @@ def get_db() -> sqlite3.Connection:
     if "db" not in g:
         g.db = sqlite3.connect(DB_PATH)
         g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys=ON")
+        g.db.execute("PRAGMA busy_timeout=5000")
     return g.db
 
 
@@ -47,6 +64,8 @@ def close_db(_: object) -> None:
 
 
 def init_db() -> None:
+    if (BASE_DIR / "disciple_live.db").exists() and not DB_PATH.exists():
+        raise RuntimeError("Legacy database found. Copy it and uploads into DATA_DIR before initializing. See README.")
     schema = """
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,20 +125,25 @@ def init_db() -> None:
 
     with closing(sqlite3.connect(DB_PATH)) as db:
         db.executescript(schema)
-        admin_exists = db.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1").fetchone()
-        if not admin_exists:
-            db.execute(
-                """
-                INSERT INTO users (name, email, password_hash, role, bio)
-                VALUES (?, ?, ?, 'admin', ?)
-                """,
-                (
-                    "Platform Admin",
-                    "admin@disciple.live",
-                    generate_password_hash("admin123"),
-                    "Default admin account",
-                ),
-            )
+        columns = {row[1] for row in db.execute("PRAGMA table_info(users)")}
+        if "timezone" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'")
+        if "auth_version" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 0")
+        db.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_requests_disciple ON mentor_requests(disciplee_id, discipler_id);
+            CREATE INDEX IF NOT EXISTS idx_requests_discipler ON mentor_requests(discipler_id, status);
+            CREATE INDEX IF NOT EXISTS idx_slots_discipler ON availability_slots(discipler_id, slot_time);
+            CREATE INDEX IF NOT EXISTS idx_sessions_disciple ON sessions(disciplee_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_discipler ON sessions(discipler_id);
+        """)
+        db.execute("PRAGMA optimize")
+        db.execute("CREATE TABLE IF NOT EXISTS login_attempts (key TEXT PRIMARY KEY, attempts INTEGER NOT NULL, started REAL NOT NULL)")
+        # Refuse the legacy demo account rather than silently keeping a public password.
+        legacy = db.execute("SELECT id, password_hash FROM users WHERE email='admin@disciple.live'").fetchone()
+        if legacy and check_password_hash(legacy[1], "admin123"):
+            db.execute("UPDATE users SET password_hash=? WHERE id=?", (generate_password_hash(secrets.token_urlsafe(48)), legacy[0]))
+
         db.commit()
 
 
@@ -127,7 +151,10 @@ def current_user() -> sqlite3.Row | None:
     user_id = session.get("user_id")
     if not user_id:
         return None
-    return get_db().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    user = get_db().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user or session.get("auth_version") != user["auth_version"]:
+        return None
+    return user
 
 
 def login_required(role: str | None = None):
@@ -157,12 +184,15 @@ def index():
 def register():
     if request.method == "POST":
         db = get_db()
-        name = request.form["name"].strip()
-        email = request.form["email"].strip().lower()
-        role = request.form["role"]
+        name = request.form.get("name", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        role = request.form.get("role", "")
         bio = request.form.get("bio", "").strip()
-        password = request.form["password"]
+        password = request.form.get("password", "")
 
+        if not name or len(name) > 100 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email) or len(email) > 254 or not 12 <= len(password) <= 128 or len(bio) > 2000:
+            flash("Enter your name, a valid email, and a password of 12–128 characters. Keep your bio under 2,000 characters.", "warning")
+            return redirect(url_for("register"))
         if role not in {"disciplier", "disciplee"}:
             flash("Invalid role selected.", "danger")
             return redirect(url_for("register"))
@@ -184,22 +214,37 @@ def register():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        email = request.form["email"].strip().lower()
-        password = request.form["password"]
-        user = get_db().execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        key = email[:254]
+        db = get_db()
+        now = time.time()
+        db.execute("DELETE FROM login_attempts WHERE started < ?", (now - 900,))
+        attempt = db.execute("SELECT * FROM login_attempts WHERE key=?", (key,)).fetchone()
+        if attempt and attempt["attempts"] >= 10:
+            db.commit()
+            abort(429, "Too many sign-in attempts. Try again in 15 minutes.")
+        db.execute("INSERT INTO login_attempts VALUES (?, 1, ?) ON CONFLICT(key) DO UPDATE SET attempts=attempts+1", (key, now))
+        db.commit()
+        user = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
 
-        if not user or not check_password_hash(user["password_hash"], password):
+        if len(password) > 128 or not user or not check_password_hash(user["password_hash"], password):
             flash("Invalid login credentials.", "danger")
             return redirect(url_for("login"))
 
+        db.execute("DELETE FROM login_attempts WHERE key=?", (key,))
+        db.commit()
+        session.clear()
+        session.permanent = True
         session["user_id"] = user["id"]
+        session["auth_version"] = user["auth_version"]
         flash("Welcome back!", "success")
         return redirect(url_for("dashboard"))
 
     return render_template("login.html", user=current_user())
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
 def logout():
     session.clear()
     flash("You have been logged out.", "info")
@@ -241,12 +286,13 @@ def dashboard():
         ).fetchall()
         sessions = db.execute(
             """
-            SELECT s.*, du.name AS disciplee_name, c.title AS module_title
+            SELECT s.*, a.slot_time, du.name AS disciplee_name, c.title AS module_title
             FROM sessions s
+            JOIN availability_slots a ON a.id=s.slot_id
             JOIN users du ON s.disciplee_id = du.id
             LEFT JOIN content_modules c ON s.content_module_id = c.id
             WHERE s.discipler_id = ?
-            ORDER BY s.created_at DESC
+            ORDER BY a.slot_time
             """,
             (user["id"],),
         ).fetchall()
@@ -255,7 +301,7 @@ def dashboard():
         )
 
     disciplers = db.execute(
-        "SELECT id, name, email, bio FROM users WHERE role = 'disciplier' ORDER BY name"
+        "SELECT id, name, bio FROM users WHERE role = 'disciplier' ORDER BY name"
     ).fetchall()
     requests = db.execute(
         """
@@ -283,15 +329,17 @@ def dashboard():
             accepted_ids,
         ).fetchall()
 
+    slots = [slot for slot in slots if slot["slot_time"] > utcnow()]
     modules = db.execute("SELECT * FROM content_modules ORDER BY created_at DESC").fetchall()
     sessions = db.execute(
         """
-        SELECT s.*, du.name AS discipler_name, c.title AS module_title
+        SELECT s.*, a.slot_time, du.name AS discipler_name, c.title AS module_title
         FROM sessions s
+        JOIN availability_slots a ON a.id=s.slot_id
         JOIN users du ON s.discipler_id = du.id
         LEFT JOIN content_modules c ON s.content_module_id = c.id
         WHERE s.disciplee_id = ?
-        ORDER BY s.created_at DESC
+        ORDER BY a.slot_time
         """,
         (user["id"],),
     ).fetchall()
@@ -312,9 +360,12 @@ def dashboard():
 def request_mentor():
     user = current_user()
     db = get_db()
-    discipler_id = int(request.form["discipler_id"])
-    message = request.form.get("message", "").strip()
+    discipler_id = positive_id("discipler_id")
+    if not db.execute("SELECT id FROM users WHERE id=? AND role='disciplier'", (discipler_id,)).fetchone():
+        abort(400, "Choose an available discipler.")
+    message = request.form.get("message", "").strip()[:2000]
 
+    db.execute("BEGIN IMMEDIATE")
     existing = db.execute(
         "SELECT id FROM mentor_requests WHERE disciplee_id = ? AND discipler_id = ?",
         (user["id"], discipler_id),
@@ -328,7 +379,7 @@ def request_mentor():
         INSERT INTO mentor_requests (disciplee_id, discipler_id, message, status, created_at)
         VALUES (?, ?, ?, 'pending', ?)
         """,
-        (user["id"], discipler_id, message, datetime.utcnow().isoformat()),
+        (user["id"], discipler_id, message, utcnow()),
     )
     db.commit()
     flash("Mentorship request sent.", "success")
@@ -338,7 +389,7 @@ def request_mentor():
 @app.route("/respond-request/<int:request_id>", methods=["POST"])
 @login_required("disciplier")
 def respond_request(request_id: int):
-    decision = request.form["decision"]
+    decision = request.form.get("decision", "")
     if decision not in {"accepted", "declined"}:
         flash("Invalid action.", "danger")
         return redirect(url_for("dashboard"))
@@ -346,7 +397,7 @@ def respond_request(request_id: int):
     db = get_db()
     user = current_user()
     db.execute(
-        "UPDATE mentor_requests SET status = ? WHERE id = ? AND discipler_id = ?",
+        "UPDATE mentor_requests SET status = ? WHERE id = ? AND discipler_id = ? AND status = 'pending'",
         (decision, request_id, user["id"]),
     )
     db.commit()
@@ -357,15 +408,30 @@ def respond_request(request_id: int):
 @app.route("/add-slot", methods=["POST"])
 @login_required("disciplier")
 def add_slot():
-    slot_time = request.form["slot_time"]
+    slot_time = request.form.get("slot_time", "")
     try:
         dt = datetime.fromisoformat(slot_time)
+        zone = ZoneInfo(current_user()["timezone"])
+        if dt.tzinfo is None:
+            local = dt.replace(tzinfo=zone)
+            if local.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None) != dt:
+                raise ValueError()
+            if local.utcoffset() != local.replace(fold=1).utcoffset():
+                raise ValueError()
+            dt = local
+        dt = dt.astimezone(timezone.utc)
+        if dt <= datetime.now(timezone.utc):
+            raise ValueError()
     except ValueError:
-        flash("Invalid slot date/time.", "danger")
+        flash("Choose a future time. Times skipped or repeated by daylight saving are unavailable.", "danger")
         return redirect(url_for("dashboard"))
 
     db = get_db()
     user = current_user()
+    db.execute("BEGIN IMMEDIATE")
+    if db.execute("SELECT id FROM availability_slots WHERE discipler_id=? AND abs(julianday(slot_time)-julianday(?))*1440 < 60", (user["id"], dt.isoformat())).fetchone():
+        flash("Allow a full hour between meeting times.", "warning")
+        return redirect(url_for("dashboard"))
     db.execute(
         "INSERT INTO availability_slots (discipler_id, slot_time, is_booked) VALUES (?, ?, 0)",
         (user["id"], dt.isoformat()),
@@ -380,12 +446,15 @@ def add_slot():
 def book_session():
     db = get_db()
     user = current_user()
-    slot_id = int(request.form["slot_id"])
+    slot_id = positive_id("slot_id")
     module_raw = request.form.get("content_module_id")
-    module_id = int(module_raw) if module_raw else None
+    module_id = positive_id("content_module_id") if module_raw else None
+    if module_id and not db.execute("SELECT id FROM content_modules WHERE id=?", (module_id,)).fetchone():
+        abort(400, "Choose an existing resource.")
+    db.execute("BEGIN IMMEDIATE")
 
     slot = db.execute("SELECT * FROM availability_slots WHERE id = ?", (slot_id,)).fetchone()
-    if not slot or slot["is_booked"]:
+    if not slot or slot["is_booked"] or slot["slot_time"] <= utcnow():
         flash("That slot is unavailable.", "danger")
         return redirect(url_for("dashboard"))
 
@@ -401,7 +470,10 @@ def book_session():
         flash("You can only book with accepted disciplers.", "danger")
         return redirect(url_for("dashboard"))
 
-    room = f"disciple-live-{secrets.token_hex(4)}"
+    if db.execute("SELECT s.id FROM sessions s JOIN availability_slots a ON a.id=s.slot_id WHERE s.disciplee_id=? AND abs(julianday(a.slot_time)-julianday(?))*1440 < 60", (user["id"], slot["slot_time"])).fetchone():
+        flash("You already have a meeting during that hour.", "warning")
+        return redirect(url_for("dashboard"))
+    room = f"disciple-live-{secrets.token_hex(24)}"
     db.execute("UPDATE availability_slots SET is_booked = 1 WHERE id = ?", (slot_id,))
     db.execute(
         """
@@ -415,7 +487,7 @@ def book_session():
             slot["discipler_id"],
             module_id,
             room,
-            datetime.utcnow().isoformat(),
+            utcnow(),
         ),
     )
     db.commit()
@@ -429,9 +501,13 @@ def book_session():
 def upload_content():
     db = get_db()
     user = current_user()
-    title = request.form["title"].strip()
+    title = request.form.get("title", "").strip()
     description = request.form.get("description", "").strip()
     external_url = request.form.get("external_url", "").strip()
+    if not title or len(title) > 200 or len(description) > 5000:
+        abort(400, "Provide a title under 200 characters and a description under 5,000.")
+    if external_url and not valid_url(external_url):
+        abort(400, "Use a complete HTTPS resource link.")
     uploaded = request.files.get("content_file")
     file_path = None
 
@@ -441,7 +517,7 @@ def upload_content():
         if ext not in ALLOWED_EXTENSIONS:
             flash("Unsupported file type.", "danger")
             return redirect(url_for("dashboard"))
-        stored = f"{datetime.utcnow().timestamp()}_{filename}"
+        stored = f"{secrets.token_hex(16)}_{filename}"
         uploaded.save(UPLOAD_DIR / stored)
         file_path = stored
 
@@ -454,7 +530,7 @@ def upload_content():
         INSERT INTO content_modules (title, description, file_path, external_url, created_by, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (title, description, file_path, external_url, user["id"], datetime.utcnow().isoformat()),
+        (title, description, file_path, external_url, user["id"], utcnow()),
     )
     db.commit()
     flash("Content module published.", "success")
@@ -462,8 +538,9 @@ def upload_content():
 
 
 @app.route("/uploads/<path:filename>")
+@login_required()
 def uploaded_file(filename: str):
-    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+    return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=True)
 
 
 @app.route("/session/<int:session_id>")
@@ -473,8 +550,9 @@ def session_room(session_id: int):
     user = current_user()
     sess = db.execute(
         """
-        SELECT s.*, c.title AS module_title, c.description AS module_description, c.external_url, c.file_path
+        SELECT s.*, a.slot_time, c.title AS module_title, c.description AS module_description, c.external_url, c.file_path
         FROM sessions s
+        JOIN availability_slots a ON a.id=s.slot_id
         LEFT JOIN content_modules c ON c.id = s.content_module_id
         WHERE s.id = ?
         """,
@@ -485,13 +563,209 @@ def session_room(session_id: int):
         flash("Session not found.", "danger")
         return redirect(url_for("dashboard"))
 
-    if user["id"] not in {sess["disciplee_id"], sess["disciplier_id"]} and user["role"] != "admin":
+    if user["id"] not in {sess["disciplee_id"], sess["discipler_id"]} and user["role"] != "admin":
         flash("You cannot access this session.", "danger")
         return redirect(url_for("dashboard"))
 
     return render_template("session_room.html", user=user, sess=sess)
 
 
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def positive_id(field):
+    try:
+        value = int(request.form.get(field, ""))
+        if value < 1:
+            raise ValueError()
+        return value
+    except ValueError:
+        abort(400, "Choose a valid item.")
+
+
+def valid_url(value):
+    try:
+        parsed = urlsplit(value)
+        return len(value) <= 2000 and parsed.scheme == "https" and bool(parsed.hostname) and not parsed.username and not parsed.password
+    except ValueError:
+        return False
+
+
+def csrf_token():
+    if "csrf" not in session:
+        session["csrf"] = secrets.token_urlsafe(32)
+    return session["csrf"]
+
+
+@app.context_processor
+def helpers():
+    return {"csrf_token": csrf_token}
+
+
+@app.before_request
+def protect_forms():
+    if request.method == "POST":
+        supplied = request.form.get("csrf_token", "")
+        if not supplied or not secrets.compare_digest(supplied, session.get("csrf", "")):
+            abort(400, "Your form expired. Reload the page and try again.")
+
+
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self'; script-src 'self'; frame-src https://meet.jit.si; img-src 'self' data:; form-action 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'"
+    if app.config["SESSION_COOKIE_SECURE"]:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    if request.endpoint != "static":
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.template_filter("localtime")
+def localtime(value):
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    user = current_user()
+    return dt.astimezone(ZoneInfo(user["timezone"] if user else "UTC")).strftime("%b %d, %Y · %I:%M %p %Z")
+
+
+@app.route("/profile", methods=["GET", "POST"])
+@login_required()
+def profile():
+    user = current_user()
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        bio = request.form.get("bio", "").strip()
+        zone = request.form.get("timezone", "UTC")
+        try:
+            ZoneInfo(zone)
+        except (ZoneInfoNotFoundError, ValueError):
+            abort(400, "Choose a valid time zone, such as America/Los_Angeles.")
+        if not name or len(name) > 100 or len(bio) > 2000:
+            abort(400, "Provide a name under 100 characters and a bio under 2,000.")
+        db = get_db()
+        db.execute("UPDATE users SET name=?, bio=?, timezone=? WHERE id=?", (name, bio, zone, user["id"]))
+        new_password = request.form.get("new_password", "")
+        if new_password:
+            if not check_password_hash(user["password_hash"], request.form.get("current_password", "")) or not 12 <= len(new_password) <= 128:
+                db.rollback()
+                abort(400, "Enter your current password and a new password of 12–128 characters.")
+            db.execute("UPDATE users SET password_hash=?, auth_version=auth_version+1 WHERE id=?", (generate_password_hash(new_password), user["id"]))
+        db.commit()
+        if new_password:
+            session["auth_version"] = user["auth_version"] + 1
+        flash("Profile saved.", "success")
+        return redirect(url_for("profile"))
+    return render_template("profile.html", user=user)
+
+
+@app.route("/resources")
+@login_required()
+def resources():
+    query = request.args.get("q", "").strip()[:100]
+    modules = get_db().execute("SELECT * FROM content_modules WHERE title LIKE ? OR description LIKE ? ORDER BY created_at DESC", ("%"+query+"%", "%"+query+"%")).fetchall()
+    return render_template("resources.html", user=current_user(), modules=modules, query=query)
+
+
+@app.route("/slots/<int:slot_id>/delete", methods=["POST"])
+@login_required("disciplier")
+def delete_slot(slot_id):
+    db = get_db()
+    result = db.execute("DELETE FROM availability_slots WHERE id=? AND discipler_id=? AND is_booked=0", (slot_id, current_user()["id"]))
+    if not result.rowcount:
+        abort(404, "This open time was not found.")
+    db.commit()
+    flash("Availability removed.", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/sessions/<int:session_id>/cancel", methods=["POST"])
+@login_required()
+def cancel_session(session_id):
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    meeting = db.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not meeting or current_user()["id"] not in (meeting["disciplee_id"], meeting["discipler_id"]):
+        abort(404, "Meeting not found.")
+    db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+    db.execute("UPDATE availability_slots SET is_booked=0 WHERE id=?", (meeting["slot_id"],))
+    db.commit()
+    flash("Meeting canceled. The time is available to book again.", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/resources/<int:module_id>/delete", methods=["POST"])
+@login_required("admin")
+def delete_resource(module_id):
+    db = get_db()
+    module = db.execute("SELECT * FROM content_modules WHERE id=?", (module_id,)).fetchone()
+    if not module:
+        abort(404)
+    db.execute("UPDATE sessions SET content_module_id=NULL WHERE content_module_id=?", (module_id,))
+    db.execute("DELETE FROM content_modules WHERE id=?", (module_id,))
+    db.commit()
+    if module["file_path"]:
+        (UPLOAD_DIR / Path(module["file_path"]).name).unlink(missing_ok=True)
+    flash("Resource removed.", "success")
+    return redirect(url_for("resources"))
+
+
+@app.route("/health")
+def health():
+    get_db().execute("SELECT COUNT(*) FROM users").fetchone()
+    return {"status": "ok"}
+
+
+@app.errorhandler(400)
+@app.errorhandler(403)
+@app.errorhandler(404)
+@app.errorhandler(413)
+@app.errorhandler(429)
+def error_page(error):
+    return render_template("error.html", user=current_user(), error=error), error.code
+
+
+@app.cli.command("init-db")
+def init_command():
+    init_db()
+    click.echo("Database initialized. No default accounts were created.")
+
+
+@app.cli.command("create-admin")
+@click.option("--email", prompt=True)
+@click.option("--name", prompt=True)
+@click.password_option()
+def create_admin(email, name, password):
+    if not 12 <= len(password) <= 128 or not name.strip() or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        raise click.ClickException("Use at least 12 characters.")
+    db = get_db()
+    try:
+        db.execute("INSERT INTO users(name,email,password_hash,role) VALUES (?,?,?,'admin')", (name, email.strip().lower(), generate_password_hash(password)))
+        db.commit()
+    except sqlite3.IntegrityError:
+        raise click.ClickException("This email already exists.")
+    click.echo("Administrator created.")
+
+
+@app.cli.command("reset-password")
+@click.option("--email", prompt=True)
+@click.password_option()
+def reset_password(email, password):
+    if not 12 <= len(password) <= 128:
+        raise click.ClickException("Use 12–128 characters.")
+    db = get_db()
+    result = db.execute("UPDATE users SET password_hash=?, auth_version=auth_version+1 WHERE email=?", (generate_password_hash(password), email.strip().lower()))
+    if not result.rowcount:
+        raise click.ClickException("Account not found.")
+    db.commit()
+    click.echo("Password changed. Verify the member's identity before using this command.")
+
+
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="127.0.0.1", port=5000)

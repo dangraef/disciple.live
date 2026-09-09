@@ -1,0 +1,14 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      SECRET_KEY: ${SECRET_KEY:?Set a random SECRET_KEY in .env}
+      DATA_DIR: /data
+      COOKIE_SECURE: "1"
+    volumes:
+      - disciple_data:/data
+    ports:
+      - "127.0.0.1:8000:8000"
+volumes:
+  disciple_data:

@@ -1,11 +1,1 @@
-{% extends 'base.html' %}
-{% block content %}
-<div class="card narrow">
-  <h2>Login</h2>
-  <form method="post">
-    <label>Email<input type="email" name="email" required /></label>
-    <label>Password<input type="password" name="password" required /></label>
-    <button type="submit">Sign In</button>
-  </form>
-</div>
-{% endblock %}
+{% extends 'base.html' %}{% block content %}<section class="card narrow"><p class="eyebrow">WELCOME BACK</p><h1>Continue your journey.</h1><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label>Email<input type="email" name="email" autocomplete="email" required maxlength="254"></label><label>Password<input type="password" name="password" autocomplete="current-password" required maxlength="128"></label><button>Sign in</button></form><p>New here? <a href="{{ url_for('register') }}">Create your account</a></p><p class="small">If you have forgotten your password, contact your platform administrator for help.</p></section>{% endblock %}
