@@ -1,0 +1,44 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-heading"><p class="eyebrow">PLATFORM ADMINISTRATION</p><h1>Equip the journey.</h1><p>Publish resources for members and review registered accounts.</p></div>
+<div class="grid two">
+  <section class="card">
+    <h3>Add a resource</h3>
+    <form method="post" action="{{ url_for('upload_content') }}" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>Title<input type="text" name="title" required /></label>
+      <label>Description<textarea name="description" rows="3"></textarea></label>
+      <label>Upload File<input type="file" name="content_file" accept=".pdf,.doc,.docx,.ppt,.pptx,.txt,.md" /></label>
+      <p class="small">Upload a document up to 16 MB or provide an HTTPS link.</p><label>External URL<input type="url" name="external_url" placeholder="https://..." /></label>
+      <button type="submit">Publish resource</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h3>Users</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Name</th><th>Email</th><th>Role</th></tr></thead>
+      <tbody>
+        {% for account in users %}
+        <tr><td>{{ account.name }}</td><td>{{ account.email }}</td><td>{{ {'disciplier':'Discipler','disciplee':'Seeking discipleship','admin':'Administrator'}[account.role] }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table></div>
+  </section>
+</div>
+
+<section class="card">
+  <h3>Content Library</h3>
+  <ul>
+    {% for m in modules %}
+    <li>
+      <strong>{{ m.title }}</strong> by {{ m.creator_name }}
+      {% if m.file_path %}- <a href="{{ url_for('uploaded_file', filename=m.file_path) }}">Download</a>{% endif %}
+      {% if m.external_url %}- <a href="{{ m.external_url }}" target="_blank" rel="noopener noreferrer">External Link</a>{% endif %}
+      <p>{{ m.description }}</p>
+    </li>
+    {% else %}
+    <li>No modules yet.</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endblock %}

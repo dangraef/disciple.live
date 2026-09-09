@@ -1,0 +1,59 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-heading"><p class="eyebrow">YOUR DISCIPLESHIP</p><h1>Welcome, {{ user.name }}.</h1><p>Find someone to walk alongside you, then make time to grow together.</p><p class="small">Times shown in {{ user.timezone }}. <a href="{{ url_for('profile') }}">Change time zone</a></p></div>{% include '_meetings.html' %}
+<div class="grid two">
+  <section class="card">
+    <h3>Request a Discipler</h3>
+    {% for d in disciplers %}
+    <article class="mini-card">
+      <h4>{{ d.name }}</h4>
+      <p>{{ d.bio }}</p>
+      <form method="post" action="{{ url_for('request_mentor') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="discipler_id" value="{{ d.id }}" />
+        <label>Your introduction<textarea name="message" rows="2" maxlength="2000" placeholder="Share what you'd like to learn"></textarea></label>
+        <button type="submit">Send Request</button>
+      </form>
+    </article>
+    {% else %}
+    <p>No disciplers are registered yet.</p>
+    {% endfor %}
+  </section>
+
+  <section class="card">
+    <h3>Your Requests</h3>
+    <ul>
+      {% for req in requests %}
+      <li>{{ req.discipler_name }} - <strong>{{ req.status }}</strong></li>
+      {% else %}
+      <li>No requests yet.</li>
+      {% endfor %}
+    </ul>
+  </section>
+</div>
+
+<div class="grid two">
+  <section class="card">
+    <h3>Book a Session</h3>
+    <form method="post" action="{{ url_for('book_session') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>Select Slot
+        <select name="slot_id" required>
+          <option value="">Choose...</option>
+          {% for slot in slots %}
+          <option value="{{ slot.id }}">{{ slot.discipler_name }} — {{ slot.slot_time|localtime }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Optional Content Module
+        <select name="content_module_id">
+          <option value="">None</option>
+          {% for m in modules %}
+          <option value="{{ m.id }}">{{ m.title }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button type="submit" {% if not slots %}disabled{% endif %}>Book session</button>{% if not slots %}<p class="small">Available times appear after a discipler accepts your request and adds availability.</p>{% endif %}
+    </form>
+  </section>
+
+</div>
+{% endblock %}
